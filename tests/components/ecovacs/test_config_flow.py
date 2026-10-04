@@ -14,10 +14,12 @@ from deebot_client.exceptions import (
     InvalidVerificationCodeError,
     MqttError,
 )
+from deebot_client.models import AccountCredentials, Credentials
 from deebot_client.mqtt_client import create_mqtt_config
 import pytest
 
 from homeassistant.components.ecovacs.const import (
+    CONF_CREDENTIALS,
     CONF_OVERRIDE_MQTT_URL,
     CONF_OVERRIDE_REST_URL,
     CONF_VERIFICATION_CODE,
@@ -588,4 +590,199 @@ async def test_reauth_mqtt_retry_after_device_verification(
     mock_authenticator.request_device_verification_code.assert_awaited_once()
     mock_authenticator.verify_device.assert_awaited_once_with("123456")
     assert mock_mqtt_client.verify_config.call_count == 2
+    mock_setup_entry.assert_called_once()
+
+
+@pytest.mark.usefixtures("mock_device_id", "mock_mqtt_client")
+async def test_user_flow_stores_account_credentials(
+    hass: HomeAssistant,
+    mock_setup_entry: AsyncMock,
+    mock_authenticator: Mock,
+) -> None:
+    """A successful password login stores renewable credentials before setup."""
+    mock_authenticator.account_credentials = AccountCredentials(
+        access_token="account-token", user_id="account-user-id"
+    )
+    result = await _test_user_flow(hass, _TestFnUserInput(VALID_ENTRY_DATA_CLOUD))
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"] == STORED_ENTRY_DATA_CLOUD | {
+        CONF_CREDENTIALS: {
+            "access_token": "account-token",
+            "user_id": "account-user-id",
+        }
+    }
+    mock_setup_entry.assert_called_once()
+
+
+@pytest.mark.usefixtures("mock_device_id", "mock_mqtt_client")
+async def test_verification_persists_credentials_before_reload(
+    hass: HomeAssistant,
+    mock_setup_entry: AsyncMock,
+    mock_authenticator: Mock,
+) -> None:
+    """Device verification credentials reach the entry before its first load."""
+    mock_authenticator.authenticate.side_effect = DeviceVerificationRequiredError
+
+    async def verify_device(code: str) -> None:
+        mock_authenticator.account_credentials = AccountCredentials(
+            access_token="verified-account-token", user_id="account-user-id"
+        )
+
+    mock_authenticator.verify_device.side_effect = verify_device
+    result = await _test_user_flow(hass, _TestFnUserInput(VALID_ENTRY_DATA_CLOUD))
+    assert result["step_id"] == "device_verification"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_VERIFICATION_CODE: "123456"}
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    expected = STORED_ENTRY_DATA_CLOUD | {
+        CONF_CREDENTIALS: {
+            "access_token": "verified-account-token",
+            "user_id": "account-user-id",
+        }
+    }
+    assert result["data"] == expected
+    assert mock_setup_entry.call_args.args[1].data == expected
+
+
+@pytest.mark.parametrize("reauth", [False, True])
+@pytest.mark.usefixtures("mock_device_id")
+async def test_mqtt_retry_reuses_verified_account_credentials(
+    hass: HomeAssistant,
+    mock_setup_entry: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    mock_authenticator: Mock,
+    mock_authenticator_constructor: Mock,
+    mock_mqtt_client: Mock,
+    reauth: bool,
+) -> None:
+    """A failed MQTT check must not discard the email-verified account."""
+    account = AccountCredentials(
+        access_token="verified-account-token", user_id="account-user-id"
+    )
+
+    async def authenticate() -> Credentials:
+        if (
+            mock_authenticator_constructor.call_args.kwargs.get("account_credentials")
+            != account
+        ):
+            raise DeviceVerificationRequiredError
+        return Credentials("portal-token", "portal-user-id", 0)
+
+    async def verify_device(code: str) -> None:
+        mock_authenticator.account_credentials = account
+
+    mock_authenticator.authenticate.side_effect = authenticate
+    mock_authenticator.verify_device.side_effect = verify_device
+    mock_mqtt_client.verify_config.side_effect = [MqttError, None]
+    if reauth:
+        result = await _test_reauth_flow(hass, mock_config_entry)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={CONF_PASSWORD: VALID_ENTRY_DATA_CLOUD[CONF_PASSWORD]},
+        )
+    else:
+        result = await _test_user_flow(hass, _TestFnUserInput(VALID_ENTRY_DATA_CLOUD))
+    assert result["step_id"] == "device_verification"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_VERIFICATION_CODE: "123456"}
+    )
+    assert result["step_id"] == ("reauth_confirm" if reauth else "auth")
+    assert result["errors"] == {"base": "cannot_connect"}
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_PASSWORD: VALID_ENTRY_DATA_CLOUD[CONF_PASSWORD]}
+        if reauth
+        else VALID_ENTRY_DATA_CLOUD,
+    )
+    if reauth:
+        assert result["type"] is FlowResultType.ABORT
+        assert result["reason"] == "reauth_successful"
+        data = mock_config_entry.data
+    else:
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        data = result["data"]
+    assert data[CONF_CREDENTIALS] == {
+        "access_token": account.access_token,
+        "user_id": account.user_id,
+    }
+    assert data[CONF_DEVICE_ID] == CLOUD_DEVICE_ID
+    assert mock_authenticator_constructor.call_args.args[0].device_id == CLOUD_DEVICE_ID
+    mock_authenticator.request_device_verification_code.assert_awaited_once()
+    mock_authenticator.verify_device.assert_awaited_once_with("123456")
+    mock_setup_entry.assert_called_once()
+
+
+@pytest.mark.usefixtures("mock_device_id")
+async def test_changed_password_retry_does_not_reuse_verified_credentials(
+    hass: HomeAssistant,
+    mock_setup_entry: AsyncMock,
+    mock_authenticator: Mock,
+    mock_authenticator_constructor: Mock,
+    mock_mqtt_client: Mock,
+) -> None:
+    """A changed password is validated even after an earlier verification."""
+    mock_authenticator.authenticate.side_effect = DeviceVerificationRequiredError
+
+    async def verify_device(code: str) -> None:
+        mock_authenticator.account_credentials = AccountCredentials(
+            access_token="verified-account-token", user_id="account-user-id"
+        )
+
+    mock_authenticator.verify_device.side_effect = verify_device
+    mock_mqtt_client.verify_config.side_effect = MqttError
+    result = await _test_user_flow(hass, _TestFnUserInput(VALID_ENTRY_DATA_CLOUD))
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_VERIFICATION_CODE: "123456"}
+    )
+    assert result["errors"] == {"base": "cannot_connect"}
+    mock_authenticator.authenticate.side_effect = InvalidAuthenticationError
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input=VALID_ENTRY_DATA_CLOUD | {CONF_PASSWORD: "wrong-password"},
+    )
+    assert result["errors"] == {"base": "invalid_auth"}
+    assert (
+        mock_authenticator_constructor.call_args.kwargs["account_credentials"] is None
+    )
+    mock_setup_entry.assert_not_called()
+
+
+async def test_mqtt_retry_keeps_client_id_after_password_login(
+    hass: HomeAssistant,
+    mock_setup_entry: AsyncMock,
+    mock_authenticator: Mock,
+    mock_authenticator_constructor: Mock,
+    mock_mqtt_client: Mock,
+) -> None:
+    """Token reuse must keep the client ID even before it has been stored."""
+    account = AccountCredentials(
+        access_token="account-token", user_id="account-user-id"
+    )
+
+    async def authenticate() -> Credentials:
+        call = mock_authenticator_constructor.call_args
+        assert call.args[0].device_id == "ABCDEFGH"
+        if mock_authenticator.account_credentials is not None:
+            assert call.kwargs["account_credentials"] == account
+        mock_authenticator.account_credentials = account
+        return Credentials("portal-token", "portal-user-id", 0)
+
+    mock_authenticator.authenticate.side_effect = authenticate
+    mock_mqtt_client.verify_config.side_effect = [MqttError, None]
+    with patch(
+        "homeassistant.components.ecovacs.util.random.choice",
+        side_effect=list("ABCDEFGHIJKLMNOP"),
+    ):
+        result = await _test_user_flow(hass, _TestFnUserInput(VALID_ENTRY_DATA_CLOUD))
+        assert result["errors"] == {"base": "cannot_connect"}
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], user_input=VALID_ENTRY_DATA_CLOUD
+        )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_DEVICE_ID] == "ABCDEFGH"
+    assert result["data"][CONF_CREDENTIALS] == {
+        "access_token": account.access_token,
+        "user_id": account.user_id,
+    }
     mock_setup_entry.assert_called_once()

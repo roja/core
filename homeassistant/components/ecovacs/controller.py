@@ -22,13 +22,13 @@ from deebot_client.util import md5
 from deebot_client.util.continents import get_continent
 from sucks import EcoVacsAPI, VacBot
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONF_COUNTRY,
     CONF_DEVICE_ID,
     CONF_PASSWORD,
     CONF_USERNAME,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import aiohttp_client
@@ -45,19 +45,20 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _stored_account_credentials(config: Mapping[str, Any]) -> AccountCredentials | None:
-    """Return persisted account credentials so the password login can be skipped.
-
-    When the Authenticator holds account credentials it renews portal tokens
-    silently via ``login_with_account()``, which does not re-trigger Ecovacs'
-    device-verification flow.
-    """
+    """Restore complete account credentials, or use password authentication."""
     stored = config.get(CONF_CREDENTIALS)
-    if not stored or "access_token" not in stored:
+    if not isinstance(stored, dict):
         return None
-    return AccountCredentials(
-        access_token=stored["access_token"],
-        user_id=stored["user_id"],
-    )
+    access_token = stored.get("access_token")
+    user_id = stored.get("user_id")
+    if (
+        not isinstance(access_token, str)
+        or not access_token
+        or not isinstance(user_id, str)
+        or not user_id
+    ):
+        return None
+    return AccountCredentials(access_token=access_token, user_id=user_id)
 
 
 class EcovacsController:
@@ -113,7 +114,8 @@ class EcovacsController:
         self._added_legacy_entities: set[str] = set()
 
     async def _async_persist_account_credentials(
-        self, account: AccountCredentials,
+        self,
+        account: AccountCredentials,
     ) -> None:
         """Persist account credentials so restarts skip the password login."""
         data = {"access_token": account.access_token, "user_id": account.user_id}
