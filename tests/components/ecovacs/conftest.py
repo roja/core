@@ -67,7 +67,7 @@ def device_fixture() -> str:
 
 
 @pytest.fixture
-def mock_authenticator(device_fixture: str) -> Generator[Mock]:
+def mock_authenticator_constructor(device_fixture: str) -> Generator[Mock]:
     """Mock the authenticator."""
     with (
         patch(
@@ -81,6 +81,7 @@ def mock_authenticator(device_fixture: str) -> Generator[Mock]:
     ):
         authenticator = mock.return_value
         authenticator.authenticate.return_value = Credentials("token", "user_id", 0)
+        authenticator.account_credentials = None
 
         devices = [
             load_json_object_fixture(f"devices/{device_fixture}/device.json", DOMAIN)
@@ -102,7 +103,13 @@ def mock_authenticator(device_fixture: str) -> Generator[Mock]:
                     raise ApiError("Path not mocked: {path}")
 
         authenticator.post_authenticated.side_effect = post_authenticated
-        yield authenticator
+        yield mock
+
+
+@pytest.fixture
+def mock_authenticator(mock_authenticator_constructor: Mock) -> Mock:
+    """Return the mocked authenticator instance."""
+    return mock_authenticator_constructor.return_value
 
 
 @pytest.fixture

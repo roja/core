@@ -16,6 +16,7 @@ from deebot_client.exceptions import (
     InvalidVerificationCodeError,
     MqttError,
 )
+from deebot_client.models import AccountCredentials
 from deebot_client.mqtt_client import MqttClient, create_mqtt_config
 from deebot_client.util import md5
 import voluptuous as vol
@@ -157,10 +158,24 @@ class EcovacsConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def _async_set_input(self, user_input: dict[str, Any]) -> Authenticator:
         """Set the input and create its authenticator."""
+        account: AccountCredentials | None = None
+        if self._authenticator is not None and all(
+            self._input.get(key) == user_input.get(key)
+            for key in (
+                CONF_USERNAME,
+                CONF_PASSWORD,
+                CONF_COUNTRY,
+                CONF_DEVICE_ID,
+                CONF_OVERRIDE_REST_URL,
+            )
+        ):
+            # Retrying MQTT must retain the account and device verified in this flow.
+            account = self._authenticator.account_credentials
         await self._async_teardown_authenticator()
         self._input = user_input
         self_hosted = CONF_OVERRIDE_REST_URL in user_input
-        self._device_id = get_client_device_id(self.hass, self_hosted, user_input)
+        if account is None:
+            self._device_id = get_client_device_id(self.hass, self_hosted, user_input)
         self._authenticator = Authenticator(
             create_rest_config(
                 aiohttp_client.async_get_clientsession(self.hass),
@@ -170,6 +185,7 @@ class EcovacsConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
             user_input[CONF_USERNAME],
             md5(user_input[CONF_PASSWORD]),
+            account_credentials=account,
         )
         return self._authenticator
 
@@ -207,13 +223,10 @@ class EcovacsConfigFlow(ConfigFlow, domain=DOMAIN):
     def _finish_flow(self) -> ConfigFlowResult:
         """Create or update the config entry."""
         self._input[CONF_DEVICE_ID] = self._device_id
-        # Persist account credentials so the runtime can seed the Authenticator
-        # on subsequent loads, avoiding the password login that re-triggers the
-        # device-verification challenge.
-        if (
-            (authenticator := self._authenticator) is not None
-            and (account := authenticator.account_credentials) is not None
-        ):
+        # Persist the verified account so reloads can avoid password authentication.
+        if (authenticator := self._authenticator) is not None and (
+            account := authenticator.account_credentials
+        ) is not None:
             self._input[CONF_CREDENTIALS] = {
                 "access_token": account.access_token,
                 "user_id": account.user_id,
